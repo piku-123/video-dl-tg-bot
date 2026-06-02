@@ -22,15 +22,35 @@ const downloadAndSendVideo = async (bot, chatId, url, statusMsgId = null) => {
         }
 
         const data = response.data.data;
-        const videoLinkObj = data.links?.find(link => link.type === 'Video' && link.url);
-        if (!videoLinkObj) throw new Error('Video link not found.');
+        if (!data || !data.links || !data.links.length) {
+            throw new Error('API থেকে কোনো লিংক পাওয়া যায়নি');
+        }
 
-        const videoUrl = videoLinkObj.url;
-        const title = data.title || 'Video';
-        const caption = `${title}\n\n🔗 Source: ${url}`;
+        // ১) ভিডিও লিংক নির্বাচন: প্রথমে HD, তারপর SD, যে কোনো ভিডিও
+        const videoLinks = data.links.filter(link => {
+            const type = (link.type || '').toLowerCase();
+            return type === 'video' || type === 'mp4';
+        });
 
-        // ভিডিওর সাইজ বের করা (হেডার রিকোয়েস্ট)
-        await editMsg('📊 Checking video size...');
+        if (videoLinks.length === 0) {
+            throw new Error('ভিডিও টাইপের লিংক খুঁজে পাওয়া যায়নি');
+        }
+
+        // HD কে প্রাধান্য দাও (quality 'HD' অথবা '720p' বা উচ্চ রেজোলিউশন)
+        let selectedVideo = videoLinks.find(link => link.quality === 'HD' || link.quality === '720p');
+        if (!selectedVideo) {
+            selectedVideo = videoLinks.find(link => link.quality === 'SD');
+        }
+        if (!selectedVideo) {
+            selectedVideo = videoLinks[0]; // ডিফল্ট প্রথমটা
+        }
+
+        const videoUrl = selectedVideo.url;
+        const title = data.title || 'ভিডিও';
+        const caption = `${title}\n\n🔗 উৎস: ${url}`;
+
+        // ২) সাইজ চেক (হেডার রিকোয়েস্ট)
+        await editMsg('📊 ভিডিওর সাইজ চেক করা হচ্ছে...');
         let fileSizeMB = 0;
         try {
             const headRes = await axios.head(videoUrl, { timeout: 10000 });
@@ -41,13 +61,12 @@ const downloadAndSendVideo = async (bot, chatId, url, statusMsgId = null) => {
         }
 
         if (fileSizeMB > 0 && fileSizeMB > 50) {
-            // ৫০ এমবির বেশি: লিংক পাঠাও
             const linkMsg = `⚠️ ভিডিওটির সাইজ ${fileSizeMB.toFixed(2)} MB, যা টেলিগ্রামের ৫০ MB সীমা অতিক্রম করে।\n\nডাউনলোড লিংক নিচে দেওয়া হলো:\n${videoUrl}`;
             await editMsg(linkMsg);
             return;
         }
 
-        // ৫০ এমবির কম: সরাসরি ভিডিও পাঠাও
+        // ৩) সরাসরি ভিডিও পাঠানো
         await editMsg('📥 ভিডিও ডাউনলোড করে পাঠানো হচ্ছে...');
         const videoStream = await axios.get(videoUrl, { responseType: 'stream', timeout: 60000 });
         await bot.sendVideo(chatId, videoStream.data, {
