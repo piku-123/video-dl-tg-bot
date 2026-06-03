@@ -1,23 +1,43 @@
 const axios = require('axios');
 const { DL_API } = require('../config');
 
-// In-memory store: maps "chatId_msgId" -> array of quality options
+// In-memory store: maps "chatId_msgId" -> quality options
 const pendingSelections = {};
+
+// Escape only chars that break Telegram Markdown v1
+const escapeMarkdown = (text) => {
+    return (text || '').replace(/[_*`\[]/g, '\\$&');
+};
+
+// Try to get file size via HEAD request (returns MB or 0 if unavailable)
+const getFileSizeMB = async (url) => {
+    try {
+        const res = await axios.head(url, {
+            timeout: 8000,
+            headers: { 'User-Agent': 'Mozilla/5.0' }
+        });
+        const bytes = parseInt(res.headers['content-length'] || '0');
+        return bytes > 0 ? bytes / (1024 * 1024) : 0;
+    } catch (_) {
+        return 0;
+    }
+};
+
+// Format size for display
+const formatSize = (mb) => {
+    if (mb <= 0) return null;
+    return mb >= 1024 ? `${(mb / 1024).toFixed(2)} GB` : `${mb.toFixed(1)} MB`;
+};
 
 /**
  * Fetch available qualities from API and show inline keyboard to user.
+ * Attempts to show file size on each quality button.
  */
 const fetchAndShowQualities = async (bot, chatId, url, statusMsgId) => {
     const editMsg = async (text, options = {}) => {
         try {
-            await bot.editMessageText(text, {
-                chat_id: chatId,
-                message_id: statusMsgId,
-                ...options
-            });
-        } catch (e) {
-            console.error('editMsg error:', e.message);
-        }
+            await bot.editMessageText(text, { chat_id: chatId, message_id: statusMsgId, ...options });
+        } catch (e) { console.error('editMsg error:', e.message); }
     };
 
     try {
@@ -35,7 +55,6 @@ const fetchAndShowQualities = async (bot, chatId, url, statusMsgId) => {
             throw new Error('No downloadable links found from API.');
         }
 
-        // Filter video links only
         const videoLinks = data.links.filter(link => {
             const type = (link.type || '').toLowerCase();
             return type === 'video' || type === 'mp4';
@@ -47,27 +66,27 @@ const fetchAndShowQualities = async (bot, chatId, url, statusMsgId) => {
 
         const title = data.title || 'Video';
 
-        // Store options keyed by chatId + statusMsgId
-        const storeKey = `${chatId}_${statusMsgId}`;
-        pendingSelections[storeKey] = { videoLinks, title, url };
+        await editMsg('📊 Checking file sizes...');
 
-        // Build inline keyboard — one button per quality
+        // Try to get size for each quality in parallel
+        const sizes = await Promise.all(videoLinks.map(link => getFileSizeMB(link.url)));
+
+        // Store with sizes
+        const storeKey = `${chatId}_${statusMsgId}`;
+        pendingSelections[storeKey] = { videoLinks, sizes, title, url };
+
+        // Build keyboard with size info
         const keyboard = videoLinks.map((link, index) => {
             const quality = link.quality || `Option ${index + 1}`;
-            const type = link.type?.toUpperCase() || 'VIDEO';
-            return [{ text: `📥 ${quality} (${type})`, callback_data: `dl_${storeKey}_${index}` }];
+            const sizeLabel = sizes[index] > 0 ? ` · ${formatSize(sizes[index])}` : '';
+            return [{ text: `📥 ${quality}${sizeLabel}`, callback_data: `dl_${storeKey}_${index}` }];
         });
 
-        // Add cancel button
         keyboard.push([{ text: '❌ Cancel', callback_data: `dl_cancel_${storeKey}` }]);
 
         await editMsg(
-            `🎬 *${escapeMarkdown(title)}*\n\n` +
-            `Choose a quality to download:`,
-            {
-                parse_mode: 'Markdown',
-                reply_markup: { inline_keyboard: keyboard }
-            }
+            `🎬 *${escapeMarkdown(title)}*\n\nChoose a quality to download:`,
+            { parse_mode: 'Markdown', reply_markup: { inline_keyboard: keyboard } }
         );
 
     } catch (error) {
@@ -79,8 +98,9 @@ const fetchAndShowQualities = async (bot, chatId, url, statusMsgId) => {
 };
 
 /**
- * Download selected quality and send to user.
- * Handles files up to 2GB using Telegram's URL-based sendVideo/sendDocument.
+ * Stream video directly from source URL and pipe to Telegram.
+ * Works for all sizes — no intermediate file, no temp storage.
+ * For DASH/stream URLs where content-length is unavailable, still streams fine.
  */
 const downloadSelectedQuality = async (bot, chatId, storeKey, qualityIndex, callbackQueryId) => {
     const entry = pendingSelections[storeKey];
@@ -90,7 +110,7 @@ const downloadSelectedQuality = async (bot, chatId, storeKey, qualityIndex, call
         return;
     }
 
-    const { videoLinks, title, url } = entry;
+    const { videoLinks, sizes, title, url } = entry;
     const selectedVideo = videoLinks[qualityIndex];
 
     if (!selectedVideo) {
@@ -98,104 +118,68 @@ const downloadSelectedQuality = async (bot, chatId, storeKey, qualityIndex, call
         return;
     }
 
-    // Clean up stored selection
     delete pendingSelections[storeKey];
 
-    // Acknowledge the callback
-    await bot.answerCallbackQuery(callbackQueryId, { text: '⏳ Processing your download...' });
+    await bot.answerCallbackQuery(callbackQueryId, { text: '⏳ Processing...' });
 
-    // Parse statusMsgId from storeKey: "chatId_msgId"
     const statusMsgId = parseInt(storeKey.split('_')[1]);
 
     const editMsg = async (text, options = {}) => {
         try {
-            await bot.editMessageText(text, {
-                chat_id: chatId,
-                message_id: statusMsgId,
-                ...options
-            });
-        } catch (e) {
-            console.error('editMsg error:', e.message);
-        }
+            await bot.editMessageText(text, { chat_id: chatId, message_id: statusMsgId, ...options });
+        } catch (e) { console.error('editMsg error:', e.message); }
     };
 
     const videoUrl = selectedVideo.url;
     const quality = selectedVideo.quality || 'Unknown';
-    const caption = `🎬 *${escapeMarkdown(title)}*\n📊 Quality: ${quality}\n🔗 Source: ${url}`;
+    const fileSizeMB = sizes?.[qualityIndex] || 0;
+    const sizeLabel = fileSizeMB > 0 ? ` · ${formatSize(fileSizeMB)}` : '';
+    const caption = `🎬 *${escapeMarkdown(title)}*\n📊 ${escapeMarkdown(quality)}${sizeLabel}`;
 
     try {
-        await editMsg('📊 Checking file size...');
+        await editMsg(`📥 Downloading${sizeLabel ? ` ${sizeLabel.trim()}` : ''}...`);
 
-        // Check file size via HEAD request
-        let fileSizeMB = 0;
-        try {
-            const headRes = await axios.head(videoUrl, { timeout: 15000 });
-            const bytes = parseInt(headRes.headers['content-length'] || '0');
-            fileSizeMB = bytes / (1024 * 1024);
-        } catch (e) {
-            console.warn('Size check failed, proceeding anyway...');
-        }
-
-        console.log(`File size: ${fileSizeMB.toFixed(2)} MB`);
-
-        if (fileSizeMB > 50) {
-            // Over 50MB — don't stream, just send direct link
-            // Avoids server load and Telegram URL fetch failures
-            const sizeText = fileSizeMB > 0 ? `📦 Size: ${fileSizeMB.toFixed(2)} MB\n` : '';
-            await editMsg(
-                `🎬 *${escapeMarkdown(title)}*\n` +
-                `📊 Quality: ${escapeMarkdown(quality)}\n` +
-                `${sizeText}\n` +
-                `⚠️ File is too large to send directly.\n` +
-                `Tap the button below to download:`,
-                {
-                    parse_mode: 'Markdown',
-                    reply_markup: {
-                        inline_keyboard: [[
-                            { text: '⬇️ Download Now', url: videoUrl }
-                        ]]
-                    }
-                }
-            );
-            return;
-        }
-
-        // Under 50MB — stream directly
-        await editMsg('📥 Downloading and sending...');
+        // Stream directly from source and pipe to Telegram — no temp file
         const videoStream = await axios.get(videoUrl, {
             responseType: 'stream',
-            timeout: 120000
+            timeout: 300000, // 5 min timeout for large files
+            headers: {
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+                'Referer': new URL(url).origin,
+            }
         });
+
         await bot.sendVideo(chatId, videoStream.data, {
             caption,
             parse_mode: 'Markdown',
             supports_streaming: true,
         });
 
-        // Delete status message after successful send
-        try {
-            await bot.deleteMessage(chatId, statusMsgId);
-        } catch (_) {}
+        try { await bot.deleteMessage(chatId, statusMsgId); } catch (_) {}
 
-        // Send success summary
-        const sizeText = fileSizeMB > 0 ? ` (${fileSizeMB.toFixed(2)} MB)` : '';
         await bot.sendMessage(chatId,
-            `✅ *Done!*\n📊 Quality: ${quality}${sizeText}`,
+            `✅ *Done!* — ${escapeMarkdown(quality)}${sizeLabel}`,
             { parse_mode: 'Markdown' }
         );
 
     } catch (error) {
         console.error('Download error:', error.message);
+
+        // Fallback: give direct link if streaming fails
         await editMsg(
-            `❌ *Download Failed*\n\n${error.message}\n\nTry again or use the direct link:\n${videoUrl}`,
-            { parse_mode: 'Markdown' }
+            `⚠️ *Couldn't send directly*\n\n` +
+            `Quality: ${escapeMarkdown(quality)}${sizeLabel}\n\n` +
+            `Use the button below to download manually:`,
+            {
+                parse_mode: 'Markdown',
+                reply_markup: {
+                    inline_keyboard: [[{ text: '⬇️ Download Now', url: videoUrl }]]
+                }
+            }
         );
     }
 };
 
-/**
- * Handle cancel button press.
- */
 const cancelSelection = async (bot, chatId, storeKey, callbackQueryId, statusMsgId) => {
     delete pendingSelections[storeKey];
     await bot.answerCallbackQuery(callbackQueryId, { text: 'Cancelled.' });
@@ -207,13 +191,4 @@ const cancelSelection = async (bot, chatId, storeKey, callbackQueryId, statusMsg
     } catch (_) {}
 };
 
-// Escape only the characters that break Telegram's Markdown v1 parser
-const escapeMarkdown = (text) => {
-    return (text || '').replace(/[_*`\[]/g, '\\$&');
-};
-
-module.exports = {
-    fetchAndShowQualities,
-    downloadSelectedQuality,
-    cancelSelection
-};
+module.exports = { fetchAndShowQualities, downloadSelectedQuality, cancelSelection };
