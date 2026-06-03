@@ -1,15 +1,14 @@
 const axios = require('axios');
 const { DL_API } = require('../config');
 
-// In-memory store: maps "chatId_msgId" -> quality options
+// Your Render service public URL — set this in config.js or env
+// e.g. https://video-dl-tg-bot.onrender.com
+const { BASE_URL } = require('../config');
+
 const pendingSelections = {};
 
-// Escape only chars that break Telegram Markdown v1
-const escapeMarkdown = (text) => {
-    return (text || '').replace(/[_*`\[]/g, '\\$&');
-};
+const escapeMarkdown = (text) => (text || '').replace(/[_*`\[]/g, '\\$&');
 
-// Try to get file size via HEAD request (returns MB or 0 if unavailable)
 const getFileSizeMB = async (url) => {
     try {
         const res = await axios.head(url, {
@@ -18,21 +17,18 @@ const getFileSizeMB = async (url) => {
         });
         const bytes = parseInt(res.headers['content-length'] || '0');
         return bytes > 0 ? bytes / (1024 * 1024) : 0;
-    } catch (_) {
-        return 0;
-    }
+    } catch (_) { return 0; }
 };
 
-// Format size for display
 const formatSize = (mb) => {
     if (mb <= 0) return null;
     return mb >= 1024 ? `${(mb / 1024).toFixed(2)} GB` : `${mb.toFixed(1)} MB`;
 };
 
-/**
- * Fetch available qualities from API and show inline keyboard to user.
- * Attempts to show file size on each quality button.
- */
+// Build proxy URL — Telegram fetches this, we stream from real source
+const proxyUrl = (videoUrl) =>
+    `${BASE_URL}/proxy?url=${encodeURIComponent(videoUrl)}`;
+
 const fetchAndShowQualities = async (bot, chatId, url, statusMsgId) => {
     const editMsg = async (text, options = {}) => {
         try {
@@ -60,28 +56,22 @@ const fetchAndShowQualities = async (bot, chatId, url, statusMsgId) => {
             return type === 'video' || type === 'mp4';
         });
 
-        if (videoLinks.length === 0) {
-            throw new Error('No video format links found. Try a different URL.');
-        }
+        if (videoLinks.length === 0) throw new Error('No video format links found. Try a different URL.');
 
         const title = data.title || 'Video';
 
         await editMsg('📊 Checking file sizes...');
 
-        // Try to get size for each quality in parallel
         const sizes = await Promise.all(videoLinks.map(link => getFileSizeMB(link.url)));
 
-        // Store with sizes
         const storeKey = `${chatId}_${statusMsgId}`;
         pendingSelections[storeKey] = { videoLinks, sizes, title, url };
 
-        // Build keyboard with size info
         const keyboard = videoLinks.map((link, index) => {
             const quality = link.quality || `Option ${index + 1}`;
             const sizeLabel = sizes[index] > 0 ? ` · ${formatSize(sizes[index])}` : '';
             return [{ text: `📥 ${quality}${sizeLabel}`, callback_data: `dl_${storeKey}_${index}` }];
         });
-
         keyboard.push([{ text: '❌ Cancel', callback_data: `dl_cancel_${storeKey}` }]);
 
         await editMsg(
@@ -97,14 +87,8 @@ const fetchAndShowQualities = async (bot, chatId, url, statusMsgId) => {
     }
 };
 
-/**
- * Stream video directly from source URL and pipe to Telegram.
- * Works for all sizes — no intermediate file, no temp storage.
- * For DASH/stream URLs where content-length is unavailable, still streams fine.
- */
 const downloadSelectedQuality = async (bot, chatId, storeKey, qualityIndex, callbackQueryId) => {
     const entry = pendingSelections[storeKey];
-
     if (!entry) {
         await bot.answerCallbackQuery(callbackQueryId, { text: '⚠️ Session expired. Please send the link again.' });
         return;
@@ -112,18 +96,15 @@ const downloadSelectedQuality = async (bot, chatId, storeKey, qualityIndex, call
 
     const { videoLinks, sizes, title, url } = entry;
     const selectedVideo = videoLinks[qualityIndex];
-
     if (!selectedVideo) {
         await bot.answerCallbackQuery(callbackQueryId, { text: '⚠️ Invalid selection.' });
         return;
     }
 
     delete pendingSelections[storeKey];
-
     await bot.answerCallbackQuery(callbackQueryId, { text: '⏳ Processing...' });
 
     const statusMsgId = parseInt(storeKey.split('_')[1]);
-
     const editMsg = async (text, options = {}) => {
         try {
             await bot.editMessageText(text, { chat_id: chatId, message_id: statusMsgId, ...options });
@@ -137,19 +118,12 @@ const downloadSelectedQuality = async (bot, chatId, storeKey, qualityIndex, call
     const caption = `🎬 *${escapeMarkdown(title)}*\n📊 ${escapeMarkdown(quality)}${sizeLabel}`;
 
     try {
-        await editMsg(`📥 Downloading${sizeLabel ? ` ${sizeLabel.trim()}` : ''}...`);
+        await editMsg(`📥 Sending${sizeLabel ? ` ${sizeLabel.trim()}` : ''}...`);
 
-        // Stream directly from source and pipe to Telegram — no temp file
-        const videoStream = await axios.get(videoUrl, {
-            responseType: 'stream',
-            timeout: 300000, // 5 min timeout for large files
-            headers: {
-                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
-                'Referer': new URL(url).origin,
-            }
-        });
-
-        await bot.sendVideo(chatId, videoStream.data, {
+        // Give Telegram our proxy URL — Telegram fetches it server-side,
+        // our /proxy endpoint streams from the real source.
+        // This bypasses the 50MB bot-library streaming limit entirely.
+        await bot.sendVideo(chatId, proxyUrl(videoUrl), {
             caption,
             parse_mode: 'Markdown',
             supports_streaming: true,
@@ -164,12 +138,9 @@ const downloadSelectedQuality = async (bot, chatId, storeKey, qualityIndex, call
 
     } catch (error) {
         console.error('Download error:', error.message);
-
-        // Fallback: give direct link if streaming fails
+        // Last resort: direct download button
         await editMsg(
-            `⚠️ *Couldn't send directly*\n\n` +
-            `Quality: ${escapeMarkdown(quality)}${sizeLabel}\n\n` +
-            `Use the button below to download manually:`,
+            `⚠️ *Couldn't send directly*\n\nQuality: ${escapeMarkdown(quality)}${sizeLabel}\n\nUse the button below:`,
             {
                 parse_mode: 'Markdown',
                 reply_markup: {
