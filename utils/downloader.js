@@ -138,51 +138,39 @@ const downloadSelectedQuality = async (bot, chatId, storeKey, qualityIndex, call
 
         console.log(`File size: ${fileSizeMB.toFixed(2)} MB`);
 
-        if (fileSizeMB > 0 && fileSizeMB > 2000) {
-            // Over 2GB — Telegram can't handle this at all
+        if (fileSizeMB > 50) {
+            // Over 50MB — don't stream, just send direct link
+            // Avoids server load and Telegram URL fetch failures
+            const sizeText = fileSizeMB > 0 ? `📦 Size: ${fileSizeMB.toFixed(2)} MB\n` : '';
             await editMsg(
-                `⚠️ *File Too Large*\n\n` +
-                `Size: ${fileSizeMB.toFixed(2)} MB\n` +
-                `Telegram's maximum limit is 2 GB.\n\n` +
-                `[Direct Download Link](${videoUrl})`,
-                { parse_mode: 'Markdown' }
+                `🎬 *${escapeMarkdown(title)}*\n` +
+                `📊 Quality: ${escapeMarkdown(quality)}\n` +
+                `${sizeText}\n` +
+                `⚠️ File is too large to send directly.\n` +
+                `Tap the button below to download:`,
+                {
+                    parse_mode: 'Markdown',
+                    reply_markup: {
+                        inline_keyboard: [[
+                            { text: '⬇️ Download Now', url: videoUrl }
+                        ]]
+                    }
+                }
             );
             return;
         }
 
-        if (fileSizeMB > 50) {
-            // Between 50MB and 2GB — use Telegram Bot API's URL upload
-            // Telegram fetches the file directly from the URL server-side
-            await editMsg(`📤 Uploading ${fileSizeMB.toFixed(2)} MB via Telegram servers...`);
-
-            try {
-                await bot.sendVideo(chatId, videoUrl, {
-                    caption,
-                    parse_mode: 'Markdown',
-                    supports_streaming: true,
-                });
-            } catch (videoErr) {
-                // Fallback: send as document if sendVideo fails for large files
-                console.warn('sendVideo failed, trying sendDocument:', videoErr.message);
-                await bot.sendDocument(chatId, videoUrl, {
-                    caption,
-                    parse_mode: 'Markdown',
-                });
-            }
-
-        } else {
-            // Under 50MB — stream directly
-            await editMsg('📥 Downloading and sending...');
-            const videoStream = await axios.get(videoUrl, {
-                responseType: 'stream',
-                timeout: 120000
-            });
-            await bot.sendVideo(chatId, videoStream.data, {
-                caption,
-                parse_mode: 'Markdown',
-                supports_streaming: true,
-            });
-        }
+        // Under 50MB — stream directly
+        await editMsg('📥 Downloading and sending...');
+        const videoStream = await axios.get(videoUrl, {
+            responseType: 'stream',
+            timeout: 120000
+        });
+        await bot.sendVideo(chatId, videoStream.data, {
+            caption,
+            parse_mode: 'Markdown',
+            supports_streaming: true,
+        });
 
         // Delete status message after successful send
         try {
@@ -219,8 +207,9 @@ const cancelSelection = async (bot, chatId, storeKey, callbackQueryId, statusMsg
     } catch (_) {}
 };
 
+// Escape only the characters that break Telegram's Markdown v1 parser
 const escapeMarkdown = (text) => {
-    return (text || '').replace(/[_*[\]()~`>#+=|{}.!-]/g, '\\$&');
+    return (text || '').replace(/[_*`\[]/g, '\\$&');
 };
 
 module.exports = {
